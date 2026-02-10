@@ -73,8 +73,8 @@ ROOT_URL = f"https://jmail.world/drive/folder/doj/vol{FOLDER_MIN}"
 STATE_FILE_NAME = "jdrive_download_state.json"
 MANIFEST_FILE_NAME = "manifest.jsonl"
 
-NO_PROGRESS_SCROLL_LIMIT = 35
-MAX_SCROLLS = 800
+NO_PROGRESS_SCROLL_LIMIT = 200
+MAX_SCROLLS = 100000
 PAGE_RETRIES = 3
 FILE_RETRIES = 3
 
@@ -655,7 +655,7 @@ class DownloaderWorker(QObject):
             except Exception:
                 pass
 
-            page.wait_for_timeout(420)
+            page.wait_for_timeout(700)
 
         try:
             page.remove_listener("response", on_response)
