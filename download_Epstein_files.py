@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import unquote, urljoin, urlparse
 
-# Force software rendering early (before any Qt/WebEngine init)
 os.environ.setdefault("QT_OPENGL", "software")
 os.environ["QSG_RHI_BACKEND"] = "opengl"
 os.environ.setdefault("QT_ANGLE_PLATFORM", "swiftshader")
@@ -24,7 +23,7 @@ os.environ.setdefault(
 )
 os.environ.setdefault("QT_LOGGING_RULES", "qt.webenginecontext.warning=false;qt.webenginecontext.info=false")
 
-# -------------------- Network backend (curl_cffi required) --------------------
+# Network backend
 try:
     from curl_cffi import requests as cf_requests
 except Exception:
@@ -60,11 +59,11 @@ except Exception:
 
 ROOT_URL = "https://www.justice.gov/epstein"
 STATE_FILE_NAME = "epstein_download_state.json"
-TOTAL_EPSTEIN_FILES = 36_229  # hardcoded total requested
+FILES_PER_PAGE_OBJECTIVE = 50
+TOTAL_EPSTEIN_FILES = 804_650  
 DATASET_MIN = 1
 DATASET_MAX = 12
 
-# Hardcoded page count per dataset (authoritative, no page discovery by guessing)
 DATASET_PAGE_COUNTS = {
     1: 63,
     2: 12,
@@ -224,16 +223,18 @@ class DownloadResult:
 
 class DownloaderWorker(QObject):
     log = Signal(str)
-    progress = Signal(int, int)  # processed, discovered
-    progress_total = Signal(int, int)  # processed, total_epstein
-    finished = Signal(int, int, int, str)  # downloaded, skipped, failed, status
-    auth_required = Signal(str, int, int)  # url, dataset, page
+    progress = Signal(int, int)  
+    progress_total = Signal(int, int)  
+    dataset_info = Signal(int, int, int, int)  
+    finished = Signal(int, int, int, str) 
+    auth_required = Signal(str, int, int)  
 
     def __init__(self, output_dir: Path, resume_state: Optional[dict], cookie_store: SharedCookieStore):
         super().__init__()
         self.output_dir = output_dir
         self.resume_state = resume_state or {}
-        self.total_epstein = int(self.resume_state.get("total_epstein") or TOTAL_EPSTEIN_FILES)
+        self.total_epstein = int(TOTAL_EPSTEIN_FILES)
+        self._dataset_processed_counts: Dict[int, int] = {}
         self.cookie_store = cookie_store
         self._stop = False
 
@@ -278,6 +279,7 @@ class DownloaderWorker(QObject):
             "fail_reason": fail_reason,
             "updated_at_epoch": int(time.time()),
             "total_epstein": int(self.total_epstein or 0),
+            "dataset_processed_counts": {str(k): int(v) for k, v in sorted(self._dataset_processed_counts.items())},
         }
         save_state(state)
 
@@ -294,21 +296,19 @@ class DownloaderWorker(QObject):
             merged += 1
         return merged
 
-    def _emit_progress(self, processed_count: int, discovered_count: int) -> None:
-        discovered_safe = max(1, int(discovered_count))
-        self.progress.emit(int(processed_count), discovered_safe)
+    def _emit_progress(self, dataset_processed: int, dataset_target: int, global_processed: int, dataset_idx: int) -> None:
+        dataset_target_safe = max(1, int(dataset_target))
+        dataset_processed_safe = max(0, int(dataset_processed))
+        self.progress.emit(dataset_processed_safe, dataset_target_safe)
+        self.dataset_info.emit(int(dataset_idx), int(DATASET_MAX), dataset_processed_safe, dataset_target_safe)
 
-        total = int(self.total_epstein or 0)
-        if total <= 0:
-            total = discovered_safe
-        total = max(1, total)
-        self.progress_total.emit(int(processed_count), total)
+        total = max(1, int(self.total_epstein or 0))
+        global_processed_safe = max(0, int(global_processed))
+        self.progress_total.emit(global_processed_safe, total)
 
     def _estimate_total_epstein_files(self, already_known: set[str]) -> int:
         _ = already_known
-        fixed_total = int(TOTAL_EPSTEIN_FILES)
-        self.log.emit(f"Using hardcoded total Epstein files: {fixed_total}")
-        return fixed_total
+        return int(TOTAL_EPSTEIN_FILES)
 
     def _request_page_html(self, url: str, retries: int = PAGE_RETRIES) -> Tuple[Optional[str], str]:
         last_reason = "unknown error"
@@ -413,7 +413,6 @@ class DownloaderWorker(QObject):
                 if code >= 400:
                     return DownloadResult(False, f"HTTP {code}", permanent_skip=True)
 
-                # Stream file to disk (curl_cffi Response is NOT a context manager)
                 with open(temp, "wb") as f:
                     wrote = 0
                     for chunk in resp.iter_content(chunk_size=1024 * 128):
@@ -480,10 +479,8 @@ class DownloaderWorker(QObject):
         else:
             self.log.emit("Starting fresh: dataset 1, page 1.")
 
-        if self.total_epstein <= 0:
-            self.total_epstein = self._estimate_total_epstein_files(discovered | processed)
-        else:
-            self.log.emit(f"Loaded total Epstein files from checkpoint: {self.total_epstein}")
+        self.total_epstein = int(TOTAL_EPSTEIN_FILES)
+        self.log.emit(f"Using fixed global objective: {self.total_epstein} files.")
 
         plan_str = ", ".join(
             f"DS{ds}:{DATASET_PAGE_COUNTS.get(ds, 1)}"
@@ -491,9 +488,21 @@ class DownloaderWorker(QObject):
         )
         self.log.emit(f"Hardcoded page plan -> {plan_str}")
 
-        cur0 = len(processed)
-        tot0 = max(cur0, len(discovered))
-        self._emit_progress(cur0, max(1, tot0))
+        raw_counts = self.resume_state.get("dataset_processed_counts") or {}
+        try:
+            self._dataset_processed_counts = {int(k): int(v) for k, v in raw_counts.items()}
+        except Exception:
+            self._dataset_processed_counts = {}
+
+        # Initial UI state
+        current_ds_for_ui = max(DATASET_MIN, min(DATASET_MAX, start_ds))
+        current_ds_target = max(1, int(DATASET_PAGE_COUNTS.get(current_ds_for_ui, 1)) * FILES_PER_PAGE_OBJECTIVE)
+        current_ds_processed = int(self._dataset_processed_counts.get(current_ds_for_ui, 0))
+        if current_ds_processed <= 0 and start_page > 1 and current_ds_for_ui == start_ds:
+            current_ds_processed = min((start_page - 1) * FILES_PER_PAGE_OBJECTIVE, current_ds_target)
+
+        global_processed0 = len(processed)
+        self._emit_progress(current_ds_processed, current_ds_target, global_processed0, current_ds_for_ui)
 
         try:
             for ds in range(start_ds, DATASET_MAX + 1):
@@ -513,6 +522,12 @@ class DownloaderWorker(QObject):
 
                 max_pages = int(DATASET_PAGE_COUNTS.get(ds, 1))
                 page = start_page if ds == start_ds else 1
+                ds_target_files = max(1, max_pages * FILES_PER_PAGE_OBJECTIVE)
+                ds_processed_files = int(self._dataset_processed_counts.get(ds, 0))
+                if ds_processed_files <= 0 and ds == start_ds and page > 1:
+                    ds_processed_files = min((page - 1) * FILES_PER_PAGE_OBJECTIVE, ds_target_files)
+
+                self._emit_progress(ds_processed_files, ds_target_files, len(processed), ds)
 
                 if page > max_pages:
                     self.log.emit(
@@ -606,10 +621,10 @@ class DownloaderWorker(QObject):
                             if target.exists():
                                 skipped += 1
                                 processed.add(pdf_url)
-                                cur = len(processed)
-                                tot = max(cur, len(discovered))
-                                self._emit_progress(cur, max(tot, 1))
-                                self.log.emit(f"[{cur}/{tot}] EXISTS: {file_name}")
+                                ds_processed_files += 1
+                                self._dataset_processed_counts[ds] = ds_processed_files
+                                self._emit_progress(ds_processed_files, ds_target_files, len(processed), ds)
+                                self.log.emit(f"[DS{ds} {ds_processed_files}/{ds_target_files}] EXISTS: {file_name}")
                                 continue
 
                             res = self._download_pdf(pdf_url, target, referer=page_url)
@@ -617,16 +632,16 @@ class DownloaderWorker(QObject):
                             if res.ok:
                                 downloaded += 1
                                 processed.add(pdf_url)
-                                cur = len(processed)
-                                tot = max(cur, len(discovered))
-                                self._emit_progress(cur, max(tot, 1))
-                                self.log.emit(f"[{cur}/{tot}] OK: {file_name}")
+                                ds_processed_files += 1
+                                self._dataset_processed_counts[ds] = ds_processed_files
+                                self._emit_progress(ds_processed_files, ds_target_files, len(processed), ds)
+                                self.log.emit(f"[DS{ds} {ds_processed_files}/{ds_target_files}] OK: {file_name}")
                             else:
                                 failed += 1
                                 processed.add(pdf_url)
-                                cur = len(processed)
-                                tot = max(cur, len(discovered))
-                                self._emit_progress(cur, max(tot, 1))
+                                ds_processed_files += 1
+                                self._dataset_processed_counts[ds] = ds_processed_files
+                                self._emit_progress(ds_processed_files, ds_target_files, len(processed), ds)
                                 self.log.emit(
                                     f"[SKIP-FAILED] {pdf_url} failed after {FILE_RETRIES} attempts "
                                     f"({res.reason}). Skipping this file and continuing."
@@ -856,7 +871,8 @@ class MainWindow(QMainWindow):
 
         self.worker_thread: Optional[QThread] = None
         self.worker: Optional[DownloaderWorker] = None
-        self._last_total_epstein: int = 0
+        self._last_total_epstein: int = TOTAL_EPSTEIN_FILES
+        self._last_global_processed_files: int = 0
 
         self._build_ui()
         self._apply_style()
@@ -913,12 +929,16 @@ class MainWindow(QMainWindow):
         il.addWidget(self.lbl_output, 1)
         root.addWidget(info)
 
+        self.lbl_dataset_info = QLabel(f"Extracting Data Set: 0/{DATASET_MAX}")
+        self.lbl_dataset_info.setObjectName("status")
+        root.addWidget(self.lbl_dataset_info)
+
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         root.addWidget(self.progress)
 
-        self.lbl_status = QLabel("Processed / Discovered: 0 / 0 (0%)")
+        self.lbl_status = QLabel("Current Data Set files: 0 / 0 (0%)")
         self.lbl_status.setObjectName("status")
         root.addWidget(self.lbl_status)
 
@@ -927,7 +947,7 @@ class MainWindow(QMainWindow):
         self.progress_total.setValue(0)
         root.addWidget(self.progress_total)
 
-        self.lbl_status_total = QLabel("Processed / Total Epstein files: 0 / 0 (0%)")
+        self.lbl_status_total = QLabel(f"Global files objective: 0 / {TOTAL_EPSTEIN_FILES} (0%)")
         self.lbl_status_total.setObjectName("status")
         root.addWidget(self.lbl_status_total)
 
@@ -1115,9 +1135,11 @@ class MainWindow(QMainWindow):
 
         self.progress.setValue(0)
         self.progress_total.setValue(0)
-        self._last_total_epstein = 0
-        self.lbl_status.setText("Processed / Discovered: 0 / 0 (0%)")
-        self.lbl_status_total.setText("Processed / Total Epstein files: 0 / 0 (0%)")
+        self._last_total_epstein = TOTAL_EPSTEIN_FILES
+        self._last_global_processed_files = 0
+        self.lbl_dataset_info.setText(f"Extracting Data Set: 0/{DATASET_MAX}")
+        self.lbl_status.setText("Current Data Set files: 0 / 0 (0%)")
+        self.lbl_status_total.setText(f"Global files objective: 0 / {TOTAL_EPSTEIN_FILES} (0%)")
         self.append_log("Session setup...")
 
         self.btn_start.setEnabled(False)
@@ -1134,6 +1156,7 @@ class MainWindow(QMainWindow):
         self.worker.log.connect(self.append_log)
         self.worker.progress.connect(self.on_progress)
         self.worker.progress_total.connect(self.on_progress_total)
+        self.worker.dataset_info.connect(self.on_dataset_info)
         self.worker.finished.connect(self.on_finished)
         self.worker.auth_required.connect(self.on_auth_required)
 
@@ -1149,29 +1172,42 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("Stopping...")
 
     def on_progress(self, current: int, total: int):
+        total = max(0, int(total))
+        current = max(0, int(current))
         if total <= 0:
             pct = 0
         else:
             pct = int((current / total) * 100)
             pct = max(0, min(100, pct))
         self.progress.setValue(pct)
-        self.lbl_status.setText(f"Processed / Discovered: {current} / {total} ({pct}%)")
+        self.lbl_status.setText(f"Current Data Set files: {current} / {total} ({pct}%)")
 
     def on_progress_total(self, current: int, total_epstein: int):
+        current = max(0, int(current))
         total_epstein = max(0, int(total_epstein))
         self._last_total_epstein = total_epstein
+        self._last_global_processed_files = current
 
         if total_epstein <= 0:
             self.progress_total.setValue(0)
-            self.lbl_status_total.setText(f"Processed / Total Epstein files: {current} / 0 (0%)")
+            self.lbl_status_total.setText(f"Global files objective: {current} / 0 (0%)")
             return
 
         pct = int((current / total_epstein) * 100)
         pct = max(0, min(100, pct))
         self.progress_total.setValue(pct)
         self.lbl_status_total.setText(
-            f"Processed / Total Epstein files: {current} / {total_epstein} ({pct}%)"
+            f"Global files objective: {current} / {total_epstein} ({pct}%)"
         )
+
+    def on_dataset_info(self, dataset_idx: int, total_datasets: int, dataset_processed: int, dataset_target: int):
+        dataset_idx = max(DATASET_MIN, min(DATASET_MAX, int(dataset_idx)))
+        total_datasets = max(DATASET_MAX, int(total_datasets))
+        dataset_processed = max(0, int(dataset_processed))
+        dataset_target = max(1, int(dataset_target))
+        pct = int((dataset_processed / dataset_target) * 100)
+        pct = max(0, min(100, pct))
+        self.lbl_dataset_info.setText(f"Extracting Data Set: {dataset_idx}/{total_datasets}")
 
     def on_auth_required(self, url: str, ds: int, pg: int):
         self.append_log(
@@ -1183,13 +1219,13 @@ class MainWindow(QMainWindow):
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
 
-        processed_final = downloaded + skipped + failed
+        processed_final = max(self._last_global_processed_files, 0)
         if self._last_total_epstein > 0:
             pct2 = int((processed_final / self._last_total_epstein) * 100)
             pct2 = max(0, min(100, pct2))
             self.progress_total.setValue(pct2)
             self.lbl_status_total.setText(
-                f"Processed / Total Epstein files: {processed_final} / {self._last_total_epstein} ({pct2}%)"
+                f"Global files objective: {processed_final} / {self._last_total_epstein} ({pct2}%)"
             )
 
         if status == "completed":
