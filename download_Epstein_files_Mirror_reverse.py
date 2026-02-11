@@ -154,7 +154,7 @@ try:
 except Exception:
     MAX_CONSECUTIVE_ITEM_FAILURES = 20
 
-ENABLE_GENERIC_TOKEN_EXPANSION = _bool_env("JD_ENABLE_GENERIC_TOKEN_EXPANSION", False)
+ENABLE_GENERIC_TOKEN_EXPANSION = _bool_env("JD_ENABLE_GENERIC_TOKEN_EXPANSION", True)
 
 PAGE_SLEEP_RANGE = (0.20, 0.55)
 FILE_SLEEP_RANGE = (0.10, 0.28)
@@ -166,7 +166,7 @@ ABS_DOC_RE = re.compile(r"https?://[^\"' ]+/drive/(?:vol\d{1,6}-)?[a-z0-9][a-z0-
 DOC_PATH_RE = re.compile(r"/drive/(?:vol\d{1,6}-)?[a-z0-9][a-z0-9_\-]{0,220}-pdf", re.I)
 # URLs PDF diretos (com ou sem querystring)
 ABS_PDF_RE = re.compile(r"https?://[^\"'\s]+?\.pdf(?:\?[^\"'\s]*)?", re.I)
-REL_PDF_TOKEN_RE = re.compile(r"(?<![a-z0-9_\-])(?:doj|court|file)[a-z0-9_\-]*\.pdf(?![a-z0-9_\-])", re.I)
+REL_PDF_TOKEN_RE = re.compile(r"(?<![a-z0-9_\-])(?:[a-z]{2,16}\d[a-z0-9_\-]{0,240}|(?:doj|court|file)[a-z0-9_\-]{0,240})\.pdf(?![a-z0-9_\-])", re.I)
 GENERIC_PDF_TOKEN_RE = re.compile(r"(?<![a-z0-9_\-])([a-z0-9][a-z0-9_\-]{0,220})\.pdf(?![a-z0-9_\-])", re.I)
 PDF_URL_RE = re.compile(r"\.pdf($|\?)", re.I)
 
@@ -323,11 +323,14 @@ def extract_candidates_from_text_blob(text: str, base_url: str) -> Tuple[Set[str
         cand = urljoin(base_url, f"/{tok}")
         pdf_urls.add(cand)
 
-    # 5) Qualquer token *.pdf pode mapear para slug /drive/<token>-pdf
-    #    (desligado por omissão para evitar inflacionar descoberta com lixo)
+    # 5) Tokens *.pdf sem URL completa.
+    #    Mantemos esta expansão ativa por omissão, mas com filtro anti-lixo
+    #    para não inflacionar com nomes de assets JS/CSS.
     if ENABLE_GENERIC_TOKEN_EXPANSION:
         for stem in GENERIC_PDF_TOKEN_RE.findall(text):
             if not stem:
+                continue
+            if not looks_likely_document_stem(stem):
                 continue
             tok = f"{stem}.pdf"
             pdf_urls.add(urljoin(base_url, f"/{tok}"))
@@ -381,6 +384,39 @@ def looks_blocked(text: str) -> bool:
         "login required",
     ]
     return any(m in t for m in markers)
+
+
+_ASSET_WORD_HINTS = {
+    "bootstrap", "jquery", "react", "vue", "angular", "polyfill", "polyfills",
+    "runtime", "vendor", "bundle", "chunk", "webpack", "favicon", "font", "icons",
+    "style", "styles", "theme", "script", "analytics", "tracking", "pixel", "logo",
+    "image", "sprite", "manifest", "serviceworker", "sw", "worker", "hot-update",
+}
+
+
+def looks_likely_document_stem(stem: str) -> bool:
+    s = (stem or "").strip().lower().strip("._-")
+    if len(s) < 3:
+        return False
+
+    # Fortes sinais de documento real
+    if re.search(r"\d{3,}", s):
+        return True
+    if re.match(r"(?:doj|court|file|efta|usao|fbi|irs|sec|case|exhibit|evidence|vol)", s):
+        return True
+    if re.search(r"\d", s) and len(s) >= 5:
+        return True
+
+    # Sem dígitos + palavra típica de asset web => lixo
+    if not re.search(r"\d", s):
+        if any(w in s for w in _ASSET_WORD_HINTS):
+            return False
+        # tokens alfabéticos curtos raramente são PDFs de evidência
+        if re.fullmatch(r"[a-z]{1,5}", s):
+            return False
+
+    # fallback conservador
+    return len(s) >= 8 and not any(w in s for w in _ASSET_WORD_HINTS)
 
 
 def file_name_from_headers_or_url(resp, fallback: str) -> str:
