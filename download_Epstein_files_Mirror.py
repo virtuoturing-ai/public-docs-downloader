@@ -89,10 +89,18 @@ ABS_DOC_RE = re.compile(r"https?://[^\"' ]+/drive/(?:vol\d{1,6}-)?[a-z0-9][a-z0-
 DOC_PATH_RE = re.compile(r"/drive/(?:vol\d{1,6}-)?[a-z0-9][a-z0-9_\-]{0,220}-pdf", re.I)
 # URLs PDF diretos (com ou sem querystring)
 ABS_PDF_RE = re.compile(r"https?://[^\"'\s]+?\.pdf(?:\?[^\"'\s]*)?", re.I)
-REL_PDF_TOKEN_RE = re.compile(r"(?<![a-z0-9_\-])(?:doj|court|file)[a-z0-9_\-]*\.pdf(?![a-z0-9_\-])", re.I)
+REL_PDF_TOKEN_RE = re.compile(r"(?<![a-z0-9_\-])(?:[a-z]{2,14}\d{2,}[a-z0-9_\-]*|(?:doj|court|file)[a-z0-9_\-]*)\.pdf(?![a-z0-9_\-])", re.I)
 GENERIC_PDF_TOKEN_RE = re.compile(r"(?<![a-z0-9_\-])([a-z0-9][a-z0-9_\-]{0,220})\.pdf(?![a-z0-9_\-])", re.I)
-ENABLE_GENERIC_PDF_TOKEN_MAPPING = False
+ENABLE_GENERIC_PDF_TOKEN_MAPPING = True
+GENERIC_STEM_MAX_PER_BLOB = 4000
 PDF_URL_RE = re.compile(r"\.pdf($|\?)", re.I)
+GENERIC_STEM_BLOCKLIST_RE = re.compile(
+    r"^(?:main|app|bundle|vendor|runtime|chunk|polyfills?|index|favicon|logo|icon|sprite|thumb|"
+    r"style|styles|script|scripts|jquery|min|bootstrap|react|vue|angular|webpack|manifest|"
+    r"service-worker|robots|sitemap|google|gtm|analytics|pixel|avatar|image|images|img|font|fonts)"
+    r"(?:[-_.].*)?$",
+    re.I,
+)
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -215,19 +223,71 @@ def append_manifest_row(row: dict) -> None:
         pass
 
 
+
+
+def _hinted_prefixes_from_doc_urls(doc_urls: Set[str]) -> Set[str]:
+    hints: Set[str] = set()
+    for du in doc_urls:
+        try:
+            slug = du.rstrip("/").split("/")[-1]
+        except Exception:
+            continue
+        if slug.lower().endswith("-pdf"):
+            slug = slug[:-4]
+        slug = slug.lower()
+        m = re.match(r"([a-z]{2,14})", slug)
+        if m:
+            hints.add(m.group(1))
+    return hints
+
+
+def _is_probable_generic_pdf_stem(stem: str, hinted_prefixes: Set[str]) -> bool:
+    s = (stem or "").strip().strip("._-").lower()
+    if not s:
+        return False
+
+    if len(s) < 4 or len(s) > 220:
+        return False
+
+    if any(ch in s for ch in ("/", "\\", "?", "#", "&", "=", "%", ":", ";", "@")):
+        return False
+
+    if GENERIC_STEM_BLOCKLIST_RE.match(s):
+        return False
+
+    digit_count = sum(c.isdigit() for c in s)
+    alpha_count = sum(c.isalpha() for c in s)
+    if alpha_count == 0:
+        return False
+
+    starts_with_hint = bool(hinted_prefixes) and any(s.startswith(p) for p in hinted_prefixes)
+
+    # Mantém recall em séries documentais (ex.: EFTA00001234), sem abrir lixo em massa.
+    if digit_count == 0 and not starts_with_hint:
+        return False
+
+    # Sem hints, pede um mínimo de estrutura "código"
+    if not hinted_prefixes:
+        if digit_count < 2 and not re.match(r"^[a-z]{2,14}\d{2,}[a-z0-9_\-]*$", s):
+            return False
+
+    return True
+
+
+
 def extract_candidates_from_text_blob(text: str, base_url: str) -> Tuple[Set[str], Set[str]]:
     doc_urls: Set[str] = set()
     pdf_urls: Set[str] = set()
     if not text:
         return doc_urls, pdf_urls
 
-    # 1) URLs absolutas... páginas de documento... de PDF
+    # 1) URLs absolutas: páginas de documento e links diretos para PDF
     for u in ABS_DOC_RE.findall(text):
         doc_urls.add(normalize_url(u))
     for u in ABS_PDF_RE.findall(text):
         pdf_urls.add(u)
 
-    # 2) Caiminhos relativos /drive/...-pdf
+    # 2) Caminhos relativos /drive/...-pdf
     for rel in DOC_PATH_RE.findall(text):
         doc_urls.add(normalize_url(urljoin(base_url, rel)))
 
@@ -235,24 +295,37 @@ def extract_candidates_from_text_blob(text: str, base_url: str) -> Tuple[Set[str
     for slug in DOC_SLUG_RE.findall(text):
         doc_urls.add(normalize_url(urljoin(base_url, f"/drive/{slug}")))
 
-    # 4) Tokens de ficheiros PDF que às vezes aparecem no JSON sem URL completa
+    # 4) Tokens de ficheiros PDF em JSON sem URL completa
     for tok in REL_PDF_TOKEN_RE.findall(text):
         cand = urljoin(base_url, f"/{tok}")
         pdf_urls.add(cand)
 
-    # 5) Qualquer token *.pdf pode mapear para slug /drive/<token>-pdf
-    # Desativado por padrão para evitar descoberta de lixo em massa.
+    # 5) Mapping genérico *.pdf -> /drive/<slug>-pdf, com filtros de ruído
     if ENABLE_GENERIC_PDF_TOKEN_MAPPING:
+        hints = _hinted_prefixes_from_doc_urls(doc_urls)
+        seen: Set[str] = set()
+        added = 0
+
         for stem in GENERIC_PDF_TOKEN_RE.findall(text):
             if not stem:
                 continue
+            key = stem.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+
+            if not _is_probable_generic_pdf_stem(stem, hints):
+                continue
+
             tok = f"{stem}.pdf"
             pdf_urls.add(urljoin(base_url, f"/{tok}"))
             doc_urls.add(normalize_url(urljoin(base_url, f"/drive/{stem}-pdf")))
 
+            added += 1
+            if added >= GENERIC_STEM_MAX_PER_BLOB:
+                break
+
     return doc_urls, pdf_urls
-
-
 def extract_candidates_from_html(html: str, base_url: str) -> Tuple[Set[str], Set[str]]:
     soup = BeautifulSoup(html, "html.parser")
     doc_urls: Set[str] = set()
