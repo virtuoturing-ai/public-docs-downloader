@@ -149,6 +149,13 @@ MAX_SCROLLS = 100000
 PAGE_RETRIES = 3
 FILE_RETRIES = 3
 
+try:
+    MAX_CONSECUTIVE_ITEM_FAILURES = max(1, int(os.getenv("JD_MAX_CONSEC_FAILS", "20")))
+except Exception:
+    MAX_CONSECUTIVE_ITEM_FAILURES = 20
+
+ENABLE_GENERIC_TOKEN_EXPANSION = _bool_env("JD_ENABLE_GENERIC_TOKEN_EXPANSION", False)
+
 PAGE_SLEEP_RANGE = (0.20, 0.55)
 FILE_SLEEP_RANGE = (0.10, 0.28)
 
@@ -316,13 +323,15 @@ def extract_candidates_from_text_blob(text: str, base_url: str) -> Tuple[Set[str
         cand = urljoin(base_url, f"/{tok}")
         pdf_urls.add(cand)
 
-    # 5) Qualquer token *.pdf pode mapear na boa para slug /drive/<token>-pdf
-    for stem in GENERIC_PDF_TOKEN_RE.findall(text):
-        if not stem:
-            continue
-        tok = f"{stem}.pdf"
-        pdf_urls.add(urljoin(base_url, f"/{tok}"))
-        doc_urls.add(normalize_url(urljoin(base_url, f"/drive/{stem}-pdf")))
+    # 5) Qualquer token *.pdf pode mapear para slug /drive/<token>-pdf
+    #    (desligado por omissão para evitar inflacionar descoberta com lixo)
+    if ENABLE_GENERIC_TOKEN_EXPANSION:
+        for stem in GENERIC_PDF_TOKEN_RE.findall(text):
+            if not stem:
+                continue
+            tok = f"{stem}.pdf"
+            pdf_urls.add(urljoin(base_url, f"/{tok}"))
+            doc_urls.add(normalize_url(urljoin(base_url, f"/drive/{stem}-pdf")))
 
     return doc_urls, pdf_urls
 
@@ -1151,6 +1160,8 @@ class DownloaderWorker(QObject):
                         max(len(discovered), len(processed), total_docs, 1),
                     )
                     self.log.emit(f"Step 2/2 (folder {fidx + 1}/{folder_count}): Resolving and downloading PDFs...")
+                    consecutive_item_failures = 0
+                    folder_short_circuited = False
 
                     for idx in range(current_index, total_docs):
                         if self._stop:
@@ -1239,12 +1250,14 @@ class DownloaderWorker(QObject):
                             "error": None,
                             "ts": int(time.time()),
                         }
+                        item_failed = False
 
                         if not pdf_url:
                             failed += 1
                             processed.add(doc_url)
                             row["error"] = reason or "pdf_url_not_found"
                             self.log.emit(f"[SKIP-FAILED] Could not resolve PDF ({row['error']}).")
+                            item_failed = True
                         else:
                             fallback_name = code_from_doc_url(doc_url) or safe_filename_from_url(pdf_url)
                             target = self.output_dir / fallback_name
@@ -1275,6 +1288,7 @@ class DownloaderWorker(QObject):
                                     self.log.emit(
                                         f"[SKIP-FAILED] Download failed after {FILE_RETRIES} attempts ({res.reason})."
                                     )
+                                    item_failed = True
 
                         append_manifest_row(row)
                         self._emit_progress(
@@ -1306,17 +1320,53 @@ class DownloaderWorker(QObject):
                             current_folder_idx=fidx,
                         )
 
+                        if item_failed:
+                            consecutive_item_failures += 1
+                        else:
+                            consecutive_item_failures = 0
+
+                        if consecutive_item_failures >= MAX_CONSECUTIVE_ITEM_FAILURES:
+                            folder_short_circuited = True
+                            remaining = max(0, total_docs - (idx + 1))
+                            self.log.emit(
+                                f"[CIRCUIT-BREAK] {consecutive_item_failures} consecutive failures. "
+                                f"Skipping remaining {remaining} items in this folder and moving on."
+                            )
+                            self._checkpoint(
+                                status="running",
+                                phase="download",
+                                processed=processed,
+                                discovered=discovered,
+                                doc_pages=doc_pages,
+                                current_index=idx + 1,
+                                downloaded=downloaded,
+                                skipped=skipped,
+                                failed=failed,
+                                fail_reason=f"consecutive_failures>={MAX_CONSECUTIVE_ITEM_FAILURES}",
+                                current_folder_idx=fidx,
+                            )
+                            break
+
                         time.sleep(random.uniform(*FILE_SLEEP_RANGE))
 
                     # Folder finished -> move immediately to next folder.
-                    self.log.emit(f"Folder {fidx + 1}/{folder_count} completed.")
+                    if folder_short_circuited:
+                        self.log.emit(
+                            f"Folder {fidx + 1}/{folder_count} skipped after "
+                            f"{MAX_CONSECUTIVE_ITEM_FAILURES} consecutive failures."
+                        )
+                        volume_status = "skipped (consecutive failures)"
+                    else:
+                        self.log.emit(f"Folder {fidx + 1}/{folder_count} completed.")
+                        volume_status = "completed"
+
                     completed_volumes.add(fidx)
                     self._emit_volume_update(
                         fidx,
                         folder_count,
                         100,
                         volume_name,
-                        "completed",
+                        volume_status,
                         completed_volumes,
                     )
                     phase = "discover"
