@@ -103,6 +103,13 @@ def build_folder_urls() -> List[str]:
     return [f"https://jmail.world/drive/folder/doj/vol{i}" for i in range(FOLDER_MIN, FOLDER_MAX + 1)]
 
 
+def extract_volume_name(url: str, fallback_idx: int = 1) -> str:
+    m = re.search(r"/(vol\d+)(?:/)?$", str(url).strip(), re.I)
+    if m:
+        return m.group(1).lower()
+    return f"vol{max(1, int(fallback_idx))}"
+
+
 def runtime_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -357,8 +364,9 @@ class DownloadResult:
 
 class DownloaderWorker(QObject):
     log = Signal(str)
-    progress = Signal(int, int) 
-    progress_total = Signal(int, int) 
+    progress = Signal(int, int)
+    progress_total = Signal(int, int)
+    volume_update = Signal(int, int, int, str, str, str)
     finished = Signal(int, int, int, str)
     auth_required = Signal(str, int, int)
 
@@ -468,6 +476,21 @@ class DownloaderWorker(QObject):
 
         total = max(1, int(total_indexed or discovered_safe))
         self.progress_total.emit(int(processed_count), total)
+
+    def _emit_volume_update(
+        self,
+        current_volume_zero_based: int,
+        total_volumes: int,
+        percent: int,
+        volume_name: str,
+        state: str,
+        completed_volumes_zero_based: Set[int],
+    ) -> None:
+        total_volumes = max(1, int(total_volumes))
+        current_ui = max(1, min(total_volumes, int(current_volume_zero_based) + 1))
+        pct = max(0, min(100, int(percent)))
+        completed_csv = ",".join(str(i + 1) for i in sorted(completed_volumes_zero_based))
+        self.volume_update.emit(current_ui, total_volumes, pct, str(volume_name), str(state), completed_csv)
 
     def _request_page_html(self, url: str, retries: int = PAGE_RETRIES) -> Tuple[Optional[str], str]:
         last_reason = "unknown error"
@@ -892,6 +915,20 @@ class DownloaderWorker(QObject):
 
                 folder_page = context.new_page()
                 folder_count = len(self.folder_urls)
+                completed_volumes: Set[int] = set(range(max(0, current_folder_idx)))
+
+                current_volume_name = extract_volume_name(
+                    self.folder_urls[current_folder_idx] if self.folder_urls else "",
+                    current_folder_idx + 1,
+                )
+                self._emit_volume_update(
+                    current_folder_idx,
+                    folder_count,
+                    0,
+                    current_volume_name,
+                    "processing",
+                    completed_volumes,
+                )
 
                 for fidx in range(current_folder_idx, folder_count):
                     current_folder_idx = fidx
@@ -919,6 +956,15 @@ class DownloaderWorker(QObject):
                         return
 
                     self.log.emit(f"Scanning folder {fidx + 1}/{folder_count}: {self.folder_url}")
+                    volume_name = extract_volume_name(self.folder_url, fidx + 1)
+                    self._emit_volume_update(
+                        fidx,
+                        folder_count,
+                        0,
+                        volume_name,
+                        "processing",
+                        completed_volumes,
+                    )
 
                     resumed_this_folder = (phase == "download" and fidx == current_folder_idx and len(doc_pages) > 0)
 
@@ -929,6 +975,14 @@ class DownloaderWorker(QObject):
 
                         self.log.emit(
                             f"Step 1/2 (folder {fidx + 1}/{folder_count}): Discovering items (doc pages + direct PDFs)..."
+                        )
+                        self._emit_volume_update(
+                            fidx,
+                            folder_count,
+                            1,
+                            volume_name,
+                            "discovering",
+                            completed_volumes,
                         )
                         doc_pages, blocked = self._collect_doc_pages(
                             folder_page,
@@ -947,6 +1001,15 @@ class DownloaderWorker(QObject):
 
                         if not doc_pages:
                             self.log.emit(f"No items found in folder {fidx + 1}. Moving to next folder.")
+                            completed_volumes.add(fidx)
+                            self._emit_volume_update(
+                                fidx,
+                                folder_count,
+                                100,
+                                volume_name,
+                                "completed (no items)",
+                                completed_volumes,
+                            )
                             self._checkpoint(
                                 status="running",
                                 phase="discover",
@@ -979,10 +1042,28 @@ class DownloaderWorker(QObject):
                             failed=failed,
                             current_folder_idx=fidx,
                         )
+                        self._emit_volume_update(
+                            fidx,
+                            folder_count,
+                            5,
+                            volume_name,
+                            "processing",
+                            completed_volumes,
+                        )
                     else:
                         self.log.emit(
                             f"Resume download in folder {fidx + 1}/{folder_count}: "
                             f"continuing at item {current_index + 1}/{len(doc_pages)}."
+                        )
+                        resume_total = max(1, len(doc_pages))
+                        resume_pct = 5 + int((max(0, current_index) / resume_total) * 95)
+                        self._emit_volume_update(
+                            fidx,
+                            folder_count,
+                            resume_pct,
+                            volume_name,
+                            "processing",
+                            completed_volumes,
                         )
 
                     total_docs = len(doc_pages)
@@ -995,6 +1076,16 @@ class DownloaderWorker(QObject):
 
                     for idx in range(current_index, total_docs):
                         if self._stop:
+                            stop_total = max(1, total_docs)
+                            stop_pct = 5 + int((max(0, idx) / stop_total) * 95)
+                            self._emit_volume_update(
+                                fidx,
+                                folder_count,
+                                stop_pct,
+                                volume_name,
+                                "stopping",
+                                completed_volumes,
+                            )
                             self._checkpoint(
                                 status="stopped",
                                 phase="download",
@@ -1021,6 +1112,15 @@ class DownloaderWorker(QObject):
                                 len(processed),
                                 max(len(discovered), total_docs, 1),
                                 max(len(discovered), len(processed), total_docs, 1),
+                            )
+                            done_pct = 5 + int(((idx + 1) / max(1, total_docs)) * 95)
+                            self._emit_volume_update(
+                                fidx,
+                                folder_count,
+                                done_pct,
+                                volume_name,
+                                "processing",
+                                completed_volumes,
                             )
                             continue
 
@@ -1104,6 +1204,15 @@ class DownloaderWorker(QObject):
                             max(len(discovered), total_docs, 1),
                             max(len(discovered), len(processed), total_docs, 1),
                         )
+                        done_pct = 5 + int(((idx + 1) / max(1, total_docs)) * 95)
+                        self._emit_volume_update(
+                            fidx,
+                            folder_count,
+                            done_pct,
+                            volume_name,
+                            "processing",
+                            completed_volumes,
+                        )
 
                         self._checkpoint(
                             status="running",
@@ -1123,6 +1232,15 @@ class DownloaderWorker(QObject):
 
                     # Folder finished -> move immediately to next folder.
                     self.log.emit(f"Folder {fidx + 1}/{folder_count} completed.")
+                    completed_volumes.add(fidx)
+                    self._emit_volume_update(
+                        fidx,
+                        folder_count,
+                        100,
+                        volume_name,
+                        "completed",
+                        completed_volumes,
+                    )
                     phase = "discover"
                     current_index = 0
                     doc_pages = []
@@ -1147,11 +1265,32 @@ class DownloaderWorker(QObject):
                 browser.close()
 
             clear_state()
+            if self.folder_urls:
+                last_idx = max(0, len(self.folder_urls) - 1)
+                self._emit_volume_update(
+                    last_idx,
+                    len(self.folder_urls),
+                    100,
+                    extract_volume_name(self.folder_urls[last_idx], last_idx + 1),
+                    "completed",
+                    set(range(len(self.folder_urls))),
+                )
             self.log.emit("Completed all folders (vol1..vol12).")
             self.finished.emit(downloaded, skipped, failed, "completed")
 
         except Exception as e:
             self.log.emit(f"Unexpected error: {type(e).__name__}: {e}")
+            try:
+                self._emit_volume_update(
+                    current_folder_idx,
+                    max(1, len(self.folder_urls)),
+                    0,
+                    extract_volume_name(self.folder_urls[current_folder_idx], current_folder_idx + 1) if self.folder_urls else "vol1",
+                    "error",
+                    set(range(max(0, current_folder_idx))),
+                )
+            except Exception:
+                pass
             self._checkpoint(
                 status="error",
                 phase=phase,
@@ -1327,6 +1466,9 @@ class MainWindow(QMainWindow):
         self.worker_thread: Optional[QThread] = None
         self.worker: Optional[DownloaderWorker] = None
         self._last_total_indexed: int = 0
+        self._volume_total: int = max(1, FOLDER_MAX - FOLDER_MIN + 1)
+        self._volume_current: int = 1
+        self._volume_completed: Set[int] = set()
 
         self._build_ui()
         self._apply_style()
@@ -1383,6 +1525,22 @@ class MainWindow(QMainWindow):
         il.addWidget(self.lbl_output, 1)
         root.addWidget(info)
 
+        self.progress_volume = QProgressBar()
+        self.progress_volume.setRange(0, 100)
+        self.progress_volume.setValue(0)
+        root.addWidget(self.progress_volume)
+
+        self.lbl_volume_status = QLabel("Volume: 1/12 (0%) • vol1 • waiting.")
+        self.lbl_volume_status.setObjectName("volumeStatus")
+        root.addWidget(self.lbl_volume_status)
+
+        self.lbl_volume_list = QLabel("")
+        self.lbl_volume_list.setObjectName("volumeList")
+        self.lbl_volume_list.setTextFormat(Qt.RichText)
+        self.lbl_volume_list.setWordWrap(True)
+        root.addWidget(self.lbl_volume_list)
+        self.lbl_volume_list.setText(self._render_volume_list(self._volume_total, self._volume_current, self._volume_completed))
+
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
@@ -1436,6 +1594,17 @@ class MainWindow(QMainWindow):
                 color: #9fe6ff;
                 font-weight: 600;
                 padding-left: 2px;
+            }
+            #volumeStatus {
+                color: #b8ffe8;
+                font-weight: 700;
+                padding-left: 2px;
+            }
+            #volumeList {
+                color: #a1d7cf;
+                font-weight: 600;
+                padding-left: 2px;
+                min-height: 24px;
             }
             QPushButton {
                 background: rgba(10, 40, 45, 225);
@@ -1600,9 +1769,25 @@ class MainWindow(QMainWindow):
 
         self.progress.setValue(0)
         self.progress_total.setValue(0)
+        self.progress_volume.setValue(0)
         self._last_total_indexed = 0
+        self._volume_total = max(1, len(folder_urls))
+        start_volume = 1
+        if resume_state:
+            start_volume = max(1, min(self._volume_total, int(resume_state.get("current_folder_idx") or 0) + 1))
+            self._volume_completed = set(range(1, start_volume))
+        else:
+            self._volume_completed = set()
+        self._volume_current = start_volume
+        start_volume_name = extract_volume_name(folder_urls[start_volume - 1], start_volume) if folder_urls else "vol1"
         self.lbl_status.setText("Processed / Discovered: 0 / 0 (0%)")
         self.lbl_status_total.setText("Processed / Total indexed files: 0 / 0 (0%)")
+        self.lbl_volume_status.setText(
+            f"Volume: {start_volume}/{self._volume_total} (0%) • {start_volume_name} • processing."
+        )
+        self.lbl_volume_list.setText(
+            self._render_volume_list(self._volume_total, self._volume_current, self._volume_completed)
+        )
         self.append_log("Session setup...")
 
         self.btn_start.setEnabled(False)
@@ -1634,6 +1819,7 @@ class MainWindow(QMainWindow):
         self.worker.log.connect(self.append_log)
         self.worker.progress.connect(self.on_progress)
         self.worker.progress_total.connect(self.on_progress_total)
+        self.worker.volume_update.connect(self.on_volume_update)
         self.worker.finished.connect(self.on_finished)
         self.worker.auth_required.connect(self.on_auth_required)
 
@@ -1648,6 +1834,69 @@ class MainWindow(QMainWindow):
             self.worker.request_stop()
             self.append_log("Stop requested...")
             self.lbl_status.setText("Stopping...")
+
+    def _render_volume_list(self, total: int, current: int, completed: Set[int]) -> str:
+        total = max(1, int(total))
+        current = max(1, min(total, int(current)))
+        parts: List[str] = []
+        for i in range(1, total + 1):
+            label = f"{i}/{total}"
+            is_done = i in completed
+            is_current = i == current
+
+            if is_done:
+                item = f"✓ {label}"
+                base_style = "color:#7dffb9; font-weight:700;"
+            else:
+                item = label
+                base_style = "color:#98d9cc;"
+
+            if is_current:
+                base_style += (
+                    " background: rgba(80, 195, 255, 0.22);"
+                    " border: 1px solid rgba(130, 225, 255, 0.65);"
+                    " border-radius: 8px;"
+                    " padding: 2px 7px;"
+                    " font-weight: 800;"
+                    " color:#e7fbff;"
+                )
+            else:
+                base_style += " padding: 1px 2px;"
+
+            parts.append(f'<span style="{base_style}">{item}</span>')
+        return " · ".join(parts)
+
+    def on_volume_update(
+        self,
+        current_volume: int,
+        total_volumes: int,
+        percent: int,
+        volume_name: str,
+        state: str,
+        completed_csv: str,
+    ):
+        total_volumes = max(1, int(total_volumes))
+        current_volume = max(1, min(total_volumes, int(current_volume)))
+        percent = max(0, min(100, int(percent)))
+
+        completed: Set[int] = set()
+        if completed_csv:
+            for tok in completed_csv.split(","):
+                tok = tok.strip()
+                if tok.isdigit():
+                    val = int(tok)
+                    if 1 <= val <= total_volumes:
+                        completed.add(val)
+
+        self._volume_total = total_volumes
+        self._volume_current = current_volume
+        self._volume_completed = completed
+
+        self.progress_volume.setValue(percent)
+        self.lbl_volume_status.setText(
+            f"Volume: {current_volume}/{total_volumes} ({percent}%) • {volume_name} • {state}."
+        )
+        self.lbl_volume_list.setText(self._render_volume_list(total_volumes, current_volume, completed))
 
     def on_progress(self, current: int, total: int):
         if total <= 0:
@@ -1694,6 +1943,15 @@ class MainWindow(QMainWindow):
             )
 
         if status == "completed":
+            self.progress_volume.setValue(100)
+            self._volume_completed = set(range(1, self._volume_total + 1))
+            self.lbl_volume_list.setText(
+                self._render_volume_list(self._volume_total, self._volume_total, self._volume_completed)
+            )
+            self.lbl_volume_status.setText(
+                f"Volume: {self._volume_total}/{self._volume_total} (100%) • "
+                f"{extract_volume_name(self.worker.folder_url if self.worker else '', self._volume_total)} • completed."
+            )
             headline = f"Completed. New: {downloaded} | Existing: {skipped} | Failed: {failed}"
             detail = (
                 "Download completed.\n\n"
@@ -1702,6 +1960,10 @@ class MainWindow(QMainWindow):
                 f"Manifest: {manifest_file()}"
             )
         elif status == "stopped":
+            self.lbl_volume_status.setText(
+                f"Volume: {self._volume_current}/{self._volume_total} ({self.progress_volume.value()}%) • "
+                f"{extract_volume_name(self.worker.folder_url if self.worker else '', self._volume_current)} • stopped."
+            )
             headline = f"Stopped by user. New: {downloaded} | Existing: {skipped} | Failed: {failed}"
             detail = (
                 "Download stopped by user.\n\n"
@@ -1709,12 +1971,20 @@ class MainWindow(QMainWindow):
                 "Checkpoint saved for resume."
             )
         elif status == "auth_required":
+            self.lbl_volume_status.setText(
+                f"Volume: {self._volume_current}/{self._volume_total} ({self.progress_volume.value()}%) • "
+                f"{extract_volume_name(self.worker.folder_url if self.worker else '', self._volume_current)} • blocked."
+            )
             headline = f"Access blocked. New: {downloaded} | Existing: {skipped} | Failed: {failed}"
             detail = (
                 "Access appears blocked by login/CAPTCHA/authorization gate.\n\n"
                 "Click Start, complete manual access in the browser window, and resume."
             )
         else:
+            self.lbl_volume_status.setText(
+                f"Volume: {self._volume_current}/{self._volume_total} ({self.progress_volume.value()}%) • "
+                f"{extract_volume_name(self.worker.folder_url if self.worker else '', self._volume_current)} • {status}."
+            )
             headline = f"Finished with status '{status}'. New: {downloaded} | Existing: {skipped} | Failed: {failed}"
             detail = (
                 "Run finished with unexpected status.\n\n"
