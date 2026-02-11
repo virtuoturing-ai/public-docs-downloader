@@ -73,7 +73,7 @@ ROOT_URL = f"https://jmail.world/drive/folder/doj/vol{FOLDER_MIN}"
 STATE_FILE_NAME = "jdrive_download_state.json"
 MANIFEST_FILE_NAME = "manifest.jsonl"
 
-NO_PROGRESS_SCROLL_LIMIT = 1000
+NO_PROGRESS_SCROLL_LIMIT = 500
 MAX_SCROLLS = 100000
 PAGE_RETRIES = 3
 FILE_RETRIES = 3

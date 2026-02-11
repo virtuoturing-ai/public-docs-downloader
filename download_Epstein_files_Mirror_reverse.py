@@ -144,7 +144,7 @@ def folder_span_label() -> str:
         return f"vol{FOLDER_MAX}..vol{FOLDER_MIN} (reverse)"
     return f"vol{FOLDER_MIN}..vol{FOLDER_MAX}"
 
-NO_PROGRESS_SCROLL_LIMIT = 1000
+NO_PROGRESS_SCROLL_LIMIT = 500
 MAX_SCROLLS = 100000
 PAGE_RETRIES = 3
 FILE_RETRIES = 3
