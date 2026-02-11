@@ -64,8 +64,24 @@ TOTAL_EPSTEIN_FILES = 36_229  # hardcoded total requested
 DATASET_MIN = 1
 DATASET_MAX = 12
 
-# Stop current dataset if there is no real progress in N consecutive pages
-NO_PROGRESS_PAGE_LIMIT = 10
+# Hardcoded page count per dataset (authoritative, no page discovery by guessing)
+DATASET_PAGE_COUNTS = {
+    1: 63,
+    2: 12,
+    3: 2,
+    4: 4,
+    5: 3,
+    6: 1,
+    7: 1,
+    8: 220,
+    9: 9276,
+    10: 1,
+    11: 6507,
+    12: 3,
+}
+
+# Stop current dataset after too many consecutive page-level failures
+NO_PROGRESS_PAGE_LIMIT = 20
 
 PAGE_RETRIES = 3
 FILE_RETRIES = 3
@@ -289,54 +305,10 @@ class DownloaderWorker(QObject):
         self.progress_total.emit(int(processed_count), total)
 
     def _estimate_total_epstein_files(self, already_known: set[str]) -> int:
-        """Index pass to compute total unique PDF links across datasets 1..12."""
-        self.log.emit("Indexing total Epstein files (datasets 1..12) before download...")
-        total_urls = set(already_known)
-
-        for ds in range(DATASET_MIN, DATASET_MAX + 1):
-            if self._stop:
-                break
-
-            page = 1
-            no_progress_pages = 0
-            previous_signature = ""
-
-            while not self._stop and no_progress_pages < NO_PROGRESS_PAGE_LIMIT:
-                page_url = dataset_page_url(ds, page)
-                html, reason = self._request_page_html(page_url, retries=2)
-                if html is None:
-                    no_progress_pages += 1
-                    page += 1
-                    continue
-
-                links = self._extract_pdf_links(html, page_url)
-                if not links:
-                    no_progress_pages += 1
-                else:
-                    signature = hashlib.sha1("|".join(links).encode("utf-8")).hexdigest()
-                    if signature == previous_signature:
-                        no_progress_pages += 1
-                    else:
-                        previous_signature = signature
-                        before = len(total_urls)
-                        total_urls.update(links)
-                        added = len(total_urls) - before
-                        if added > 0:
-                            no_progress_pages = 0
-                        else:
-                            no_progress_pages += 1
-
-                if page % 25 == 0:
-                    self.log.emit(
-                        f"Indexing progress: Data Set {ds}, page {page} -> {len(total_urls)} unique files"
-                    )
-
-                page += 1
-                time.sleep(random.uniform(0.08, 0.2))
-
-        total = len(total_urls)
-        self.log.emit(f"Global total indexed: {total} Epstein files")
-        return total
+        _ = already_known
+        fixed_total = int(TOTAL_EPSTEIN_FILES)
+        self.log.emit(f"Using hardcoded total Epstein files: {fixed_total}")
+        return fixed_total
 
     def _request_page_html(self, url: str, retries: int = PAGE_RETRIES) -> Tuple[Optional[str], str]:
         last_reason = "unknown error"
@@ -483,9 +455,11 @@ class DownloaderWorker(QObject):
 
     @staticmethod
     def _page_url(ds: int, page: int) -> str:
+        base = f"https://www.justice.gov/epstein/doj-disclosures/data-set-{ds}-files"
         if page <= 1:
-            return f"https://www.justice.gov/epstein/doj-disclosures/data-set-{ds}-files"
-        return f"https://www.justice.gov/epstein/doj-disclosures/data-set-{ds}-files?page={page}"
+            return base
+        # justice.gov uses zero-based pagination in the query string
+        return f"{base}?page={page - 1}"
 
     def run(self) -> None:
         downloaded = int(self.resume_state.get("downloaded") or 0)
@@ -511,6 +485,12 @@ class DownloaderWorker(QObject):
         else:
             self.log.emit(f"Loaded total Epstein files from checkpoint: {self.total_epstein}")
 
+        plan_str = ", ".join(
+            f"DS{ds}:{DATASET_PAGE_COUNTS.get(ds, 1)}"
+            for ds in range(DATASET_MIN, DATASET_MAX + 1)
+        )
+        self.log.emit(f"Hardcoded page plan -> {plan_str}")
+
         cur0 = len(processed)
         tot0 = max(cur0, len(discovered))
         self._emit_progress(cur0, max(1, tot0))
@@ -531,23 +511,32 @@ class DownloaderWorker(QObject):
                     self.finished.emit(downloaded, skipped, failed, "stopped")
                     return
 
+                max_pages = int(DATASET_PAGE_COUNTS.get(ds, 1))
                 page = start_page if ds == start_ds else 1
+
+                if page > max_pages:
+                    self.log.emit(
+                        f"Data Set {ds}: resume page {page} is beyond hardcoded max page {max_pages}. "
+                        "Skipping dataset."
+                    )
+                    start_page = 1
+                    continue
+
                 no_progress_pages = int(self.resume_state.get("no_progress_pages") or 0) if ds == start_ds else 0
-                last_sig = ""
 
-                self.log.emit(f"Starting Data Set {ds} at page {page}.")
+                self.log.emit(f"Starting Data Set {ds} at page {page}/{max_pages} (hardcoded).")
 
-                while not self._stop:
+                while (not self._stop) and (page <= max_pages):
                     page_url = self._page_url(ds, page)
-                    self.log.emit(f"Scanning Data Set {ds}, page {page}: {page_url}")
+                    self.log.emit(f"Scanning Data Set {ds}, page {page}/{max_pages}: {page_url}")
 
                     html, reason = self._request_page_html(page_url, retries=PAGE_RETRIES)
                     if html is None:
                         failed += 1
                         no_progress_pages += 1
                         self.log.emit(
-                            f"Data Set {ds}, page {page}: failed ({reason}). "
-                            f"No-progress streak: {no_progress_pages}/{NO_PROGRESS_PAGE_LIMIT}."
+                            f"Data Set {ds}, page {page}/{max_pages}: failed ({reason}). "
+                            f"Failure streak: {no_progress_pages}/{NO_PROGRESS_PAGE_LIMIT}."
                         )
 
                         if "authorization/age gate" in reason.lower() and page == 1:
@@ -567,17 +556,11 @@ class DownloaderWorker(QObject):
                             self.finished.emit(downloaded, skipped, failed, "auth_required")
                             return
 
-                        if no_progress_pages >= NO_PROGRESS_PAGE_LIMIT:
-                            self.log.emit(
-                                f"Data Set {ds}: reached no-progress limit ({NO_PROGRESS_PAGE_LIMIT}). "
-                                "Moving to next dataset."
-                            )
-                            break
-
+                        next_page = min(page + 1, max_pages + 1)
                         self._checkpoint(
                             status="running",
                             dataset_idx=ds,
-                            page_idx=page + 1,
+                            page_idx=next_page,
                             processed=processed,
                             discovered=discovered,
                             downloaded=downloaded,
@@ -586,101 +569,87 @@ class DownloaderWorker(QObject):
                             no_progress_pages=no_progress_pages,
                             fail_reason=reason,
                         )
+
+                        if no_progress_pages >= NO_PROGRESS_PAGE_LIMIT:
+                            remaining = max_pages - page + 1
+                            self.log.emit(
+                                f"Data Set {ds}: reached failure streak limit ({NO_PROGRESS_PAGE_LIMIT}). "
+                                f"Skipping remaining {remaining} page(s) in this dataset."
+                            )
+                            break
+
                         page += 1
+                        time.sleep(random.uniform(*PAGE_SLEEP_RANGE))
                         continue
+
+                    no_progress_pages = 0
 
                     links = self._extract_pdf_links(html, page_url)
                     for u in links:
                         discovered.add(u)
 
                     if not links:
-                        no_progress_pages += 1
-                        self.log.emit(
-                            f"Data Set {ds}, page {page}: no PDF links. "
-                            f"No-progress streak: {no_progress_pages}/{NO_PROGRESS_PAGE_LIMIT}."
-                        )
+                        self.log.emit(f"Data Set {ds}, page {page}/{max_pages}: no PDF links on this page.")
                     else:
-                        sig = hashlib.sha1("|".join(links).encode("utf-8")).hexdigest()
-                        if sig == last_sig:
-                            no_progress_pages += 1
-                            self.log.emit(
-                                f"Data Set {ds}, page {page}: repeated page signature "
-                                f"(likely redirect to last page). "
-                                f"No-progress streak: {no_progress_pages}/{NO_PROGRESS_PAGE_LIMIT}."
-                            )
-                        else:
-                            last_sig = sig
-                            new_links = [u for u in links if u not in processed]
-                            if not new_links:
-                                no_progress_pages += 1
-                                self.log.emit(
-                                    f"Data Set {ds}, page {page}: found {len(links)} links but 0 new PDFs. "
-                                    f"No-progress streak: {no_progress_pages}/{NO_PROGRESS_PAGE_LIMIT}."
-                                )
-                            else:
-                                no_progress_pages = 0
-                                self.log.emit(f"Data Set {ds}, page {page}: found {len(links)} links ({len(new_links)} new).")
-
-                            for pdf_url in new_links:
-                                if self._stop:
-                                    break
-
-                                file_name = safe_filename_from_url(pdf_url)
-                                target = self.output_dir / file_name
-
-                                if target.exists():
-                                    skipped += 1
-                                    processed.add(pdf_url)
-                                    cur = len(processed)
-                                    tot = max(cur, len(discovered))
-                                    self._emit_progress(cur, max(tot, 1))
-                                    self.log.emit(f"[{cur}/{tot}] EXISTS: {file_name}")
-                                    continue
-
-                                res = self._download_pdf(pdf_url, target, referer=page_url)
-
-                                if res.ok:
-                                    downloaded += 1
-                                    processed.add(pdf_url)
-                                    cur = len(processed)
-                                    tot = max(cur, len(discovered))
-                                    self._emit_progress(cur, max(tot, 1))
-                                    self.log.emit(f"[{cur}/{tot}] OK: {file_name}")
-                                else:
-                                    failed += 1
-                                    processed.add(pdf_url)
-                                    cur = len(processed)
-                                    tot = max(cur, len(discovered))
-                                    self._emit_progress(cur, max(tot, 1))
-                                    self.log.emit(
-                                        f"[SKIP-FAILED] {pdf_url} failed after {FILE_RETRIES} attempts "
-                                        f"({res.reason}). Skipping this file and continuing."
-                                    )
-
-                                self._checkpoint(
-                                    status="running",
-                                    dataset_idx=ds,
-                                    page_idx=page,
-                                    processed=processed,
-                                    discovered=discovered,
-                                    downloaded=downloaded,
-                                    skipped=skipped,
-                                    failed=failed,
-                                    no_progress_pages=no_progress_pages,
-                                )
-                                time.sleep(random.uniform(*FILE_SLEEP_RANGE))
-
-                    if no_progress_pages >= NO_PROGRESS_PAGE_LIMIT:
+                        new_links = [u for u in links if u not in processed]
                         self.log.emit(
-                            f"Data Set {ds}: no progress in {NO_PROGRESS_PAGE_LIMIT} consecutive pages. "
-                            "Moving to next dataset."
+                            f"Data Set {ds}, page {page}/{max_pages}: found {len(links)} links ({len(new_links)} new)."
                         )
-                        break
 
+                        for pdf_url in new_links:
+                            if self._stop:
+                                break
+
+                            file_name = safe_filename_from_url(pdf_url)
+                            target = self.output_dir / file_name
+
+                            if target.exists():
+                                skipped += 1
+                                processed.add(pdf_url)
+                                cur = len(processed)
+                                tot = max(cur, len(discovered))
+                                self._emit_progress(cur, max(tot, 1))
+                                self.log.emit(f"[{cur}/{tot}] EXISTS: {file_name}")
+                                continue
+
+                            res = self._download_pdf(pdf_url, target, referer=page_url)
+
+                            if res.ok:
+                                downloaded += 1
+                                processed.add(pdf_url)
+                                cur = len(processed)
+                                tot = max(cur, len(discovered))
+                                self._emit_progress(cur, max(tot, 1))
+                                self.log.emit(f"[{cur}/{tot}] OK: {file_name}")
+                            else:
+                                failed += 1
+                                processed.add(pdf_url)
+                                cur = len(processed)
+                                tot = max(cur, len(discovered))
+                                self._emit_progress(cur, max(tot, 1))
+                                self.log.emit(
+                                    f"[SKIP-FAILED] {pdf_url} failed after {FILE_RETRIES} attempts "
+                                    f"({res.reason}). Skipping this file and continuing."
+                                )
+
+                            self._checkpoint(
+                                status="running",
+                                dataset_idx=ds,
+                                page_idx=page,
+                                processed=processed,
+                                discovered=discovered,
+                                downloaded=downloaded,
+                                skipped=skipped,
+                                failed=failed,
+                                no_progress_pages=no_progress_pages,
+                            )
+                            time.sleep(random.uniform(*FILE_SLEEP_RANGE))
+
+                    next_page = min(page + 1, max_pages + 1)
                     self._checkpoint(
                         status="running",
                         dataset_idx=ds,
-                        page_idx=page + 1,
+                        page_idx=next_page,
                         processed=processed,
                         discovered=discovered,
                         downloaded=downloaded,
@@ -688,9 +657,26 @@ class DownloaderWorker(QObject):
                         failed=failed,
                         no_progress_pages=no_progress_pages,
                     )
+
                     page += 1
                     time.sleep(random.uniform(*PAGE_SLEEP_RANGE))
 
+                if self._stop:
+                    self._checkpoint(
+                        status="stopped",
+                        dataset_idx=ds,
+                        page_idx=page,
+                        processed=processed,
+                        discovered=discovered,
+                        downloaded=downloaded,
+                        skipped=skipped,
+                        failed=failed,
+                        no_progress_pages=no_progress_pages,
+                    )
+                    self.finished.emit(downloaded, skipped, failed, "stopped")
+                    return
+
+                self.log.emit(f"Data Set {ds}: completed hardcoded range 1..{max_pages}.")
                 start_page = 1
 
             clear_state()
